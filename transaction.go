@@ -108,8 +108,8 @@ func (ta *txAdapter) Fields() *FieldName {
 	return ta.options.FieldNames
 }
 
-// Transaction 实现 dbLink：事务链路上开启嵌套事务（保存点）
-func (ta *txAdapter) Transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error {
+// transaction 实现 dbLink：事务链路上开启嵌套事务（保存点）
+func (ta *txAdapter) transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error {
 	return ta.tx.Transaction(ctx, fn)
 }
 

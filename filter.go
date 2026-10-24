@@ -22,9 +22,9 @@ type Filter struct {
 
 // loadFilteredPolicy 加载符合过滤条件的策略到 casbin 模型。
 // 分别按 P、G 条件过滤 p 分区（ptype 以 p 开头）与 g 分区（ptype 以 g 开头）。
-// filter 为 nil 时返回 ErrInvalidFilter（显式报错而非全量加载：
-// nil 全量加载会与 isFiltered 标记语义矛盾——"过滤加载"却加载了全量；
-// 官方 gorm 适配器对 nil 同样报错）
+// filter 为 nil 或 *Filter 类型的空指针时返回 ErrInvalidFilter
+// （显式报错而非全量加载：nil 全量加载会与 isFiltered 标记语义矛盾——
+// "过滤加载"却加载了全量；官方 gorm 适配器对 nil 同样报错）
 func loadFilteredPolicy(link dbLink, ctx context.Context, m model.Model, filter interface{}) error {
 	if m == nil {
 		return ErrNilModel
@@ -32,16 +32,22 @@ func loadFilteredPolicy(link dbLink, ctx context.Context, m model.Model, filter 
 	if err := link.checkActive(); err != nil {
 		return err
 	}
+	// 类型断言对值为 nil 的 *Filter 同样成功（typed-nil），
+	// 必须显式判空，否则后续 f.P 取值会 panic
 	f, ok := filter.(*Filter)
-	if !ok {
+	if !ok || f == nil {
 		return ErrInvalidFilter
 	}
-	// 依次加载 p 分区与 g 分区的过滤结果
-	for sec, values := range map[string][]string{
-		sectionPolicy: f.P,
-		sectionGroup:  f.G,
-	} {
-		if err := loadFilteredSection(link, ctx, m, sec, values); err != nil {
+	// 依次加载 p 分区与 g 分区的过滤结果（固定顺序，行为可预期）
+	sections := []struct {
+		sec    string
+		values []string
+	}{
+		{sectionPolicy, f.P},
+		{sectionGroup, f.G},
+	}
+	for _, s := range sections {
+		if err := loadFilteredSection(link, ctx, m, s.sec, s.values); err != nil {
 			return err
 		}
 	}

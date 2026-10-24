@@ -7,13 +7,18 @@
 - 实现 casbin v3 全部持久化接口：基础读写、Context 版本、批量增删、策略更新、过滤加载、事务
 - 事务适配器与普通适配器复用同一套实现，事务内任何操作均不会逃逸到事务外；
   事务提交或回滚后，适配器的任何操作返回明确的 `ErrTransactionFinished`
-- 支持自定义表名与字段名
+- 支持自定义表名与字段名（含空值的字段名配置在构造期被拒绝）
 - 批量写入自动分批（每批 100 行），全量保存 / 批量增删 / 批量更新均在事务中完成；
-  批量删除先按精确条件查主键再按主键集合一次删除（N 条规则仅 2 条 SQL）
+  批量删除先按精确条件查主键再按主键集合删除，每批 100 条规则分块执行
+  （规避 SQL Server 单语句 2100 参数上限）
 - 精确匹配删除与更新：策略规则不足 6 个字段时，尾部按空串匹配，不会误伤同前缀的其他规则
-- 规则超过 6 个字段时写入端返回 `ErrTooManyRuleFields`，拒绝静默截断
+- 写读对称保障：规则超过 6 个字段（`ErrTooManyRuleFields`）、规则为空（`ErrEmptyRule`）、
+  尾部字段为空串（`ErrTrailingEmptyField`）、长度与模型定义不符（`ErrPolicySizeMismatch`，
+  仅 SavePolicy 路径）时写入端直接拒绝，而非落库后让加载整体失败
+- 更新策略时旧规则不在库中返回 `ErrPolicyNotFound`（内存与数据库失联的显式信号）
 - `fieldIndex=-1` 兼容官方语义：忽略过滤值，清空该策略类型下的全部规则
-- 事务上下文带状态机：重复提交或回滚返回明确错误 `ErrTransactionFinished`
+- 事务上下文带状态机：重复提交或回滚返回明确错误 `ErrTransactionFinished`；
+  另提供 `Transaction` 便捷方法自动提交 / 回滚
 
 ## 安装
 
@@ -64,6 +69,10 @@ BEGIN
 END
 ```
 
+> **不要为策略表启用软删除**：适配器的清空重写（`SavePolicy`）与删除依赖物理删除语义。
+> 若表含 `deleted_at` 等软删除字段，GoFrame 会把 `DELETE` 转为软删 `UPDATE`，
+> 软删行仍占据 `(ptype, v0..v5)` 唯一索引，`SavePolicy` 重写相同规则时会报 duplicate key 错误。
+
 ## 快速开始
 
 ```go
@@ -71,7 +80,7 @@ package main
 
 import (
     "github.com/casbin/casbin/v3"
-    "github.com/lonevle/goframe-casbin-adapter"
+    gadapter "github.com/lonevle/goframe-casbin-adapter"
     "github.com/gogf/gf/v2/frame/g"
 )
 
@@ -155,17 +164,46 @@ e.LoadFilteredPolicy(&gadapter.Filter{
 ```
 
 `LoadFilteredPolicy(nil)` 返回错误而非全量加载（与官方 gorm 一致）：nil 全量加载
-会与"已过滤"标记的语义矛盾。
+会与"已过滤"标记的语义矛盾。传入 `*Filter` 类型的空指针同样返回 `ErrInvalidFilter`。
 
-## 规则字段上限
+## 规则字段校验
 
 策略表固定 6 个值字段（`v0`-`v5`），因此模型中每个策略定义最多支持 6 个值字段
 （如 `p = sub, obj, act` 为 3 个）。这也是 casbin 生态表结构的普遍上限
 （官方 gorm / xorm 适配器的 `CasbinRule` 结构体同样固定 6 个值字段）。
-规则超过 6 个字段时，写入操作返回明确的 `ErrTooManyRuleFields` 错误
-（而非静默截断导致数据悄悄丢失）。
+
+为保证"写入成功则一定可以加载回来"（写读对称），以下规则会在写入端被明确拒绝，
+而非落库后让下一次 `LoadPolicy` 整体失败：
+
+| 拒绝场景 | 错误 | 原因 |
+| --- | --- | --- |
+| 超过 6 个值字段 | `ErrTooManyRuleFields` | 超出表容量，静默截断会丢数据 |
+| 规则为空（0 个字段） | `ErrEmptyRule` | 落库后仅含 ptype，加载必然失败 |
+| 尾部字段为空串 | `ErrTrailingEmptyField` | 读取端必须裁剪尾部空串（`v0`-`v5` 数据库缺省值为空串），尾部空串的规则无法还原 |
+| 长度与模型定义不符（仅 `SavePolicy`） | `ErrPolicySizeMismatch` | p 分区要求与 token 数完全相等，g 分区要求不小于（与 casbin 加载端校验一致） |
+
+中间字段的空串不受影响（如 `["alice", "", "admin"]` 可正常存取）。
+经 enforcer 的增删改由 casbin 核心按模型校验长度，通常不会触发上表错误；
+直接使用适配器写入时需自行保证规则长度与模型定义一致。
 
 ## 事务
+
+方式一：`Transaction` 便捷方法，`fn` 返回 `nil` 自动提交、返回错误自动回滚，
+无需手动处理 Commit / Rollback：
+
+```go
+import "github.com/casbin/casbin/v3/persist"
+
+err := a.Transaction(ctx, func(tx persist.Adapter) error {
+    if err := tx.AddPolicy("p", "p", []string{"alice", "data1", "write"}); err != nil {
+        return err // 返回错误，自动回滚
+    }
+    // ... 其他策略操作，均在该事务内执行
+    return nil // 返回 nil，自动提交
+})
+```
+
+方式二：手动控制提交时机（需确保每个错误路径都调用 `Rollback`）：
 
 ```go
 ctx := context.Background()
@@ -194,7 +232,7 @@ if err := tc.Commit(); err != nil { // 提交
 纯逻辑测试无需数据库，直接运行：
 
 ```bash
-go test -v -run "TestNewFilteredAdapter|TestNewAdapterByDBNil|TestFieldNameDefaults|TestOptionsDefaults|TestRuleToData|TestRuleToFullData|TestRecordToRule|TestModelToData|TestDryRunProbe" .
+go test -v -run "TestNewFilteredAdapter|TestNewAdapterByDBNil|TestFieldNameDefaults|TestOptionsDefaults|TestRuleToData|TestValidateRule|TestAddPolicyTooManyFields|TestWriteRejectsNonRoundTrippableRules|TestLoadFilteredPolicyNilFilter|TestTxAdapterFinishedFlag|TestRuleConditionAndArgs|TestRuleToFullData|TestRecordToRule|TestModelToData|TestDryRunProbe|TestDryRunRemovePoliciesSQL" .
 ```
 
 集成测试依赖真实数据库，通过环境变量指定连接后运行（表需预先创建）：

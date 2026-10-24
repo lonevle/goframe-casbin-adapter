@@ -4,6 +4,7 @@ package gadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -42,9 +43,10 @@ type dbLink interface {
 	Model(ctx context.Context) *gdb.Model
 	// Fields 返回策略表字段名配置
 	Fields() *FieldName
-	// Transaction 在事务中执行 fn，fn 返回错误时自动回滚；
-	// 事务链路上为嵌套事务（保存点）
-	Transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error
+	// transaction 在事务中执行 fn，fn 返回错误时自动回滚；
+	// 事务链路上为嵌套事务（保存点）。
+	// 未导出：导出名 Transaction 留给基于 casbin 接口的便捷事务方法
+	transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error
 	// checkActive 校验链路是否仍可用：普通链路恒可用；
 	// 事务链路在提交或回滚后返回 ErrTransactionFinished。
 	// 各公共 CRUD 函数入口统一调用，避免用户在事务结束后
@@ -63,13 +65,18 @@ type Adapter struct {
 }
 
 // NewAdapterByDB 基于已有数据库实例创建适配器，
-// opts 可覆盖默认表名（casbin_rule）或字段名配置
+// opts 可覆盖默认表名（casbin_rule）或字段名配置；
+// 自定义字段名配置含空值时返回 ErrEmptyFieldName
 func NewAdapterByDB(db gdb.DB, opts ...Option) (*Adapter, error) {
 	if db == nil {
 		return nil, ErrDBRequired
 	}
+	options, err := newOptionsWithDefaults(opts...)
+	if err != nil {
+		return nil, err
+	}
 	return &Adapter{
-		options: newOptionsWithDefaults(opts...),
+		options: options,
 		db:      db,
 	}, nil
 }
@@ -128,9 +135,36 @@ func (a *Adapter) Model(ctx context.Context) *gdb.Model {
 // Fields 实现 dbLink：返回字段名配置
 func (a *Adapter) Fields() *FieldName { return a.options.FieldNames }
 
-// Transaction 实现 dbLink：基于数据库实例开启事务
-func (a *Adapter) Transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error {
+// transaction 实现 dbLink：基于数据库实例开启事务
+func (a *Adapter) transaction(ctx context.Context, fn func(ctx context.Context, tx gdb.TX) error) error {
 	return a.db.Transaction(ctx, fn)
+}
+
+// Transaction 在事务中执行 fn 并自动决定提交或回滚：fn 返回 nil 提交，
+// 返回错误回滚并原样返回该错误（回滚失败时附带说明）。
+// fn 收到的适配器与 BeginTransaction 返回的 TransactionContext.GetAdapter()
+// 等价，实现全部 casbin 持久化扩展接口，事务内操作均在该事务中执行：
+//
+//	err := a.Transaction(ctx, func(tx persist.Adapter) error {
+//	    if err := tx.AddPolicy("p", "p", []string{"alice", "data1", "read"}); err != nil {
+//	        return err // 自动回滚
+//	    }
+//	    return nil // 自动提交
+//	})
+//
+// 需要跨多次调用保持事务或精确控制提交时机时，使用 BeginTransaction
+func (a *Adapter) Transaction(ctx context.Context, fn func(persist.Adapter) error) error {
+	tc, err := a.BeginTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	if err = fn(tc.GetAdapter()); err != nil {
+		if rerr := tc.Rollback(); rerr != nil && !errors.Is(rerr, ErrTransactionFinished) {
+			return fmt.Errorf("%w; rollback failed: %v", err, rerr)
+		}
+		return err
+	}
+	return tc.Commit()
 }
 
 // checkActive 实现 dbLink：普通链路不存在生命周期问题，恒可用

@@ -49,7 +49,7 @@ func savePolicy(link dbLink, ctx context.Context, m model.Model) error {
 	if err != nil {
 		return err
 	}
-	return link.Transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
+	return link.transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
 		// GoFrame 出于安全考虑拒绝执行不带 WHERE 的 DELETE，
 		// 因此追加恒真条件 1=1 实现全表清空；
 		// 不使用 TRUNCATE：它属于 DDL，会隐式提交事务、无法回滚，
@@ -68,12 +68,12 @@ func savePolicy(link dbLink, ctx context.Context, m model.Model) error {
 }
 
 // addPolicy 添加单条策略到数据库。
-// 规则超过 6 个字段时返回 ErrTooManyRuleFields（表容量上限）
+// 规则为空、尾部为空串或超过 6 个字段时拒绝（写读对称约束）
 func addPolicy(link dbLink, ctx context.Context, sec, ptype string, rule []string) error {
 	if err := link.checkActive(); err != nil {
 		return err
 	}
-	if err := validateRuleLen(rule); err != nil {
+	if err := validateRule(rule); err != nil {
 		return fmt.Errorf("g-adapter: ptype %q: %w", ptype, err)
 	}
 	data := ruleToData(link.Fields(), ptype, rule)
@@ -88,7 +88,7 @@ func removePolicy(link dbLink, ctx context.Context, sec, ptype string, rule []st
 	if err := link.checkActive(); err != nil {
 		return err
 	}
-	if err := validateRuleLen(rule); err != nil {
+	if err := validateRule(rule); err != nil {
 		return fmt.Errorf("g-adapter: ptype %q: %w", ptype, err)
 	}
 	m := applyRuleWhere(link.Model(ctx), link.Fields(), ptype, rule)

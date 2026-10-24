@@ -12,7 +12,8 @@ import (
 // 必须包事务的原因：GoFrame 对字段不齐的批量数据会按字段集合
 // 拆分为多条 INSERT 分别执行（如 p 规则 3 字段与 g 规则 2 字段混批），
 // 不加事务时部分失败会留下半截数据。
-// 任一规则超过 6 个字段时返回 ErrTooManyRuleFields
+// 任一规则为空、尾部为空串或超过 6 个字段时拒绝写入
+// （ErrEmptyRule / ErrTrailingEmptyField / ErrTooManyRuleFields）
 func addPolicies(link dbLink, ctx context.Context, sec, ptype string, rules [][]string) error {
 	if len(rules) == 0 {
 		return nil
@@ -23,12 +24,12 @@ func addPolicies(link dbLink, ctx context.Context, sec, ptype string, rules [][]
 	names := link.Fields()
 	list := make(gdb.List, 0, len(rules))
 	for _, rule := range rules {
-		if err := validateRuleLen(rule); err != nil {
+		if err := validateRule(rule); err != nil {
 			return fmt.Errorf("g-adapter: ptype %q: %w", ptype, err)
 		}
 		list = append(list, ruleToData(names, ptype, rule))
 	}
-	return link.Transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
+	return link.transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
 		if _, err := link.Model(ctx).Data(list).Batch(batchSize).Insert(); err != nil {
 			return fmt.Errorf("g-adapter: failed to add %d policies: %w", len(rules), err)
 		}
@@ -37,9 +38,12 @@ func addPolicies(link dbLink, ctx context.Context, sec, ptype string, rules [][]
 }
 
 // removePolicies 批量删除策略：在事务中先按精确匹配查出目标行主键，
-// 再按主键集合一次性删除，N 条规则只需 2 条 SQL（原先为 N 条 DELETE）。
+// 再按主键集合一次性删除，每批 batchSize 条规则只需 2 条 SQL。
 // 匹配语义与单条 removePolicy 完全一致：尾部不足字段按空串匹配，
 // 不会误伤同前缀的其他规则。
+// 按 batchSize 分块执行的原因：每条规则元组携带 7 个参数，
+// SQL Server 单语句参数上限为 2100，不分块时约 300 条规则即越界；
+// 唯一索引保证每个元组至多命中一行，主键集合大小同样以批为界。
 // 不用行值 IN（(ptype,v0..) IN ((...))）的原因：SQL Server 不支持该语法；
 // 不用单条 OR 条件直接 DELETE 的原因：自定义表若含软删除字段，
 // 追加的软删除条件与 OR 的优先级组合存在边缘风险，先查 id 再删则无此问题
@@ -51,33 +55,36 @@ func removePolicies(link dbLink, ctx context.Context, sec, ptype string, rules [
 		return err
 	}
 	for _, rule := range rules {
-		if err := validateRuleLen(rule); err != nil {
+		if err := validateRule(rule); err != nil {
 			return fmt.Errorf("g-adapter: ptype %q: %w", ptype, err)
 		}
 	}
 	names := link.Fields()
-	return link.Transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
-		// 第一步：一条 SELECT 精确匹配全部待删规则的主键。
-		// 每条规则为一个完整元组条件，用 OR 连接
-		// （ruleCondition 自带括号，GoFrame 构建结果形如 (r1) OR (r2) ...）
-		m := link.Model(ctx).Where(ruleCondition(names), ruleArgs(names, ptype, rules[0])...)
-		for _, rule := range rules[1:] {
-			m = m.WhereOr(ruleCondition(names), ruleArgs(names, ptype, rule)...)
-		}
-		records, err := m.All()
-		if err != nil {
-			return fmt.Errorf("g-adapter: failed to query policies to remove: %w", err)
-		}
-		if len(records) == 0 {
-			return nil // 没有匹配行，无需删除
-		}
-		// 第二步：一条 DELETE 按主键集合删除
-		idArgs := make([]any, len(records))
-		for i, record := range records {
-			idArgs[i] = record[names.ID].Val()
-		}
-		if _, err = link.Model(ctx).WhereIn(names.ID, idArgs).Delete(); err != nil {
-			return fmt.Errorf("g-adapter: failed to remove %d policies: %w", len(idArgs), err)
+	return link.transaction(ctx, func(ctx context.Context, _ gdb.TX) error {
+		for start := 0; start < len(rules); start += batchSize {
+			chunk := rules[start : start+min(batchSize, len(rules)-start)]
+			// 第一步：一条 SELECT 精确匹配该批待删规则的主键。
+			// 每条规则为一个完整元组条件，用 OR 连接
+			// （ruleCondition 自带括号，GoFrame 构建结果形如 (r1) OR (r2) ...）
+			m := link.Model(ctx).Where(ruleCondition(names), ruleArgs(names, ptype, chunk[0])...)
+			for _, rule := range chunk[1:] {
+				m = m.WhereOr(ruleCondition(names), ruleArgs(names, ptype, rule)...)
+			}
+			records, err := m.All()
+			if err != nil {
+				return fmt.Errorf("g-adapter: failed to query policies to remove: %w", err)
+			}
+			if len(records) == 0 {
+				continue // 该批没有匹配行，无需删除
+			}
+			// 第二步：一条 DELETE 按主键集合删除
+			idArgs := make([]any, len(records))
+			for i, record := range records {
+				idArgs[i] = record[names.ID].Val()
+			}
+			if _, err = link.Model(ctx).WhereIn(names.ID, idArgs).Delete(); err != nil {
+				return fmt.Errorf("g-adapter: failed to remove %d policies: %w", len(idArgs), err)
+			}
 		}
 		return nil
 	})

@@ -1,6 +1,6 @@
 module github.com/lonevle/goframe-casbin-adapter
 
-go 1.26.10
+go 1.23.0
 
 require (
 	github.com/casbin/casbin/v3 v3.11.0

@@ -22,14 +22,61 @@ const ruleFieldCount = 6
 // batchSize 批量写入时每批的行数
 const batchSize = 100
 
-// validateRuleLen 校验规则字段数不超过表容量（6 个）。
-// 写入路径统一调用：超限直接报错而非静默截断，
-// 截断会导致写库数据与模型定义不一致（保存成功、加载失败）
-func validateRuleLen(rule []string) error {
+// validateRule 校验规则可安全持久化，全部写路径统一调用：
+//  1. 规则不能为空：空规则落库后仅含 ptype，加载时因规则长度与模型
+//     定义不符而整体失败
+//  2. 字段数不能超过表容量（6 个）：超限直接报错而非静默截断，
+//     截断会导致写库数据与模型定义不一致（保存成功、加载失败）
+//  3. 尾部字段不能为空串：读取端 recordToRule 必须裁剪尾部空串
+//     （v0-v5 数据库缺省值为空串，不裁剪则任何规则都无法通过 casbin
+//     的长度校验），尾部空串的规则因此无法还原，写入端拒绝以保证
+//     写读对称；中间字段的空串不受影响
+func validateRule(rule []string) error {
+	if len(rule) == 0 {
+		return ErrEmptyRule
+	}
 	if len(rule) > ruleFieldCount {
 		return fmt.Errorf("%w: got %d fields, rule: %v", ErrTooManyRuleFields, len(rule), rule)
 	}
+	if rule[len(rule)-1] == "" {
+		return fmt.Errorf("%w: rule: %v", ErrTrailingEmptyField, rule)
+	}
 	return nil
+}
+
+// validateRuleAgainstModel 按 casbin 加载端的长度校验（model.HasPolicyEx）
+// 确认规则与模型定义一致：p 分区要求完全相等，g 分区要求不小于。
+// 仅在能拿到模型的导出场景（SavePolicy）调用；不一致的规则落库后
+// 会让后续 LoadPolicy 整体失败
+func validateRuleAgainstModel(sec string, tokenCount int, ptype string, rule []string) error {
+	if sec == sectionPolicy && len(rule) != tokenCount {
+		return fmt.Errorf("%w: ptype %q: expected %d fields, got %d, rule: %v",
+			ErrPolicySizeMismatch, ptype, tokenCount, len(rule), rule)
+	}
+	if sec == sectionGroup && len(rule) < tokenCount {
+		return fmt.Errorf("%w: ptype %q: expected at least %d fields, got %d, rule: %v",
+			ErrPolicySizeMismatch, ptype, tokenCount, len(rule), rule)
+	}
+	return nil
+}
+
+// samePaddedRule 比较两条规则按 6 字段空串补齐后是否相同。
+// 用于更新场景：新旧完全相同时，部分驱动（如 MySQL 默认配置）
+// 对无变化 UPDATE 报告 0 行受影响，属正常而非规则缺失
+func samePaddedRule(a, b []string) bool {
+	for i := 0; i < ruleFieldCount; i++ {
+		var av, bv string
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		if av != bv {
+			return false
+		}
+	}
+	return true
 }
 
 // ruleToData 将一条策略规则转换为待写入数据库的行数据。
@@ -40,7 +87,7 @@ func ruleToData(names *FieldName, ptype string, rule []string) gdb.Map {
 	valueNames := names.ValueNames()
 	for i, v := range rule {
 		if i >= ruleFieldCount {
-			break // 防御分支：正常情况下 validateRuleLen 已拦截
+			break // 防御分支：正常情况下 validateRule 已拦截
 		}
 		data[valueNames[i]] = v
 	}
@@ -64,14 +111,18 @@ func ruleToFullData(names *FieldName, ptype string, rule []string) gdb.Map {
 
 // modelToData 将 casbin 模型中的全部策略导出为待写入的行数据，
 // 依次遍历 p 分区与 g 分区的所有规则；
-// 任一规则超过 6 个字段时返回 ErrTooManyRuleFields
+// 任一规则无法安全持久化（超表容量、尾部空串、长度与模型定义不符）
+// 时返回相应错误，保证保存成功的模型一定能完整加载回来
 func modelToData(names *FieldName, m model.Model) (gdb.List, error) {
 	var list gdb.List
 	for _, sec := range []string{sectionPolicy, sectionGroup} {
 		for ptype, ast := range m[sec] {
 			for _, rule := range ast.Policy {
-				if err := validateRuleLen(rule); err != nil {
+				if err := validateRule(rule); err != nil {
 					return nil, fmt.Errorf("g-adapter: ptype %q: %w", ptype, err)
+				}
+				if err := validateRuleAgainstModel(sec, len(ast.Tokens), ptype, rule); err != nil {
+					return nil, err
 				}
 				list = append(list, ruleToData(names, ptype, rule))
 			}

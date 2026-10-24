@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -180,9 +181,13 @@ func TestFieldNameDefaults(t *testing.T) {
 	}
 }
 
-// TestOptionsDefaults 验证配置默认值：默认表名与字段名
+// TestOptionsDefaults 验证配置默认值：默认表名与字段名、
+// 选项覆盖默认值、含空值的字段名配置被拒绝
 func TestOptionsDefaults(t *testing.T) {
-	o := newOptionsWithDefaults()
+	o, err := newOptionsWithDefaults()
+	if err != nil {
+		t.Fatalf("newOptionsWithDefaults() failed: %v", err)
+	}
 	if o.TableName != defaultTableName {
 		t.Errorf("TableName = %q, want %q", o.TableName, defaultTableName)
 	}
@@ -191,12 +196,27 @@ func TestOptionsDefaults(t *testing.T) {
 	}
 
 	// 函数式选项覆盖默认值
-	o = newOptionsWithDefaults(
+	o, err = newOptionsWithDefaults(
 		WithTableName("my_rule"),
-		WithFieldNames(&FieldName{PType: "p_type", V0: "v_0", V1: "v_1", V2: "v_2", V3: "v_3", V4: "v_4", V5: "v_5"}),
+		WithFieldNames(&FieldName{ID: "id_", PType: "p_type", V0: "v_0", V1: "v_1", V2: "v_2", V3: "v_3", V4: "v_4", V5: "v_5"}),
 	)
+	if err != nil {
+		t.Fatalf("newOptionsWithDefaults(with options) failed: %v", err)
+	}
 	if o.TableName != "my_rule" || o.FieldNames.PType != "p_type" || o.FieldNames.V0 != "v_0" {
 		t.Errorf("options not applied: %+v", o)
+	}
+
+	// 部分字段缺失（V5 为空）应在构造期报错，而非生成非法 SQL
+	_, err = newOptionsWithDefaults(WithFieldNames(&FieldName{PType: "p_type", V0: "v_0"}))
+	if !errors.Is(err, ErrEmptyFieldName) {
+		t.Errorf("partial field names: expected ErrEmptyFieldName, got %v", err)
+	}
+
+	// 构造入口同样拦截
+	db := newFakeDB(t)
+	if _, err = NewAdapterByDB(db, WithFieldNames(&FieldName{V0: "v_0"})); !errors.Is(err, ErrEmptyFieldName) {
+		t.Errorf("NewAdapterByDB partial field names: expected ErrEmptyFieldName, got %v", err)
 	}
 }
 
@@ -211,7 +231,7 @@ func TestRuleToData(t *testing.T) {
 		t.Errorf("ruleToData = %v, want %v", data, want)
 	}
 
-	// ruleToData 自身仍保持防御性截断，但写入路径已由 validateRuleLen 前置拦截
+	// ruleToData 自身仍保持防御性截断，但写入路径已由 validateRule 前置拦截
 	data = ruleToData(names, "p", []string{"a", "b", "c", "d", "e", "f", "g"})
 	if len(data) != 7 {
 		t.Errorf("expected 7 fields, got %d: %v", len(data), data)
@@ -221,24 +241,88 @@ func TestRuleToData(t *testing.T) {
 	}
 }
 
-// TestValidateRuleLen 验证规则字段数上限校验：
-// 6 个字段合法，7 个及以上返回 ErrTooManyRuleFields（不静默截断）
-func TestValidateRuleLen(t *testing.T) {
+// TestValidateRule 验证写入前的规则校验：
+// 6 个字段合法、7 个及以上返回 ErrTooManyRuleFields（不静默截断）、
+// 空规则返回 ErrEmptyRule、尾部空串返回 ErrTrailingEmptyField（写读对称）
+func TestValidateRule(t *testing.T) {
 	six := []string{"a", "b", "c", "d", "e", "f"}
-	if err := validateRuleLen(six); err != nil {
+	if err := validateRule(six); err != nil {
 		t.Errorf("6 fields should be valid, got %v", err)
 	}
-	if err := validateRuleLen(nil); err != nil {
-		t.Errorf("empty rule should be valid, got %v", err)
+	// 中间空串合法（加载端保留中间空字段）
+	if err := validateRule([]string{"a", "", "c"}); err != nil {
+		t.Errorf("middle empty field should be valid, got %v", err)
 	}
 
+	// 空规则
+	if err := validateRule(nil); !errors.Is(err, ErrEmptyRule) {
+		t.Errorf("nil rule: expected ErrEmptyRule, got %v", err)
+	}
+	if err := validateRule([]string{}); !errors.Is(err, ErrEmptyRule) {
+		t.Errorf("empty rule: expected ErrEmptyRule, got %v", err)
+	}
+
+	// 尾部空串：无法从数据库还原（读取端裁剪尾部空串）
+	if err := validateRule([]string{"a", "b", ""}); !errors.Is(err, ErrTrailingEmptyField) {
+		t.Errorf("trailing empty field: expected ErrTrailingEmptyField, got %v", err)
+	}
+
+	// 超过表容量
 	seven := append(append([]string(nil), six...), "g")
-	err := validateRuleLen(seven)
+	err := validateRule(seven)
 	if err == nil {
 		t.Fatal("7 fields should be rejected")
 	}
 	if !errors.Is(err, ErrTooManyRuleFields) {
 		t.Errorf("expected ErrTooManyRuleFields, got %v", err)
+	}
+}
+
+// TestWriteRejectsNonRoundTrippableRules 验证无法从数据库还原的规则
+// 在写入入口被拒绝（校验先于数据库操作，无需真实连接）：
+// 空规则与尾部空串规则
+func TestWriteRejectsNonRoundTrippableRules(t *testing.T) {
+	db := newFakeDB(t)
+	a, err := NewAdapterByDB(db)
+	if err != nil {
+		t.Fatalf("failed to create adapter: %v", err)
+	}
+	if err = a.AddPolicy("p", "p", nil); !errors.Is(err, ErrEmptyRule) {
+		t.Errorf("AddPolicy empty rule: expected ErrEmptyRule, got %v", err)
+	}
+	if err = a.AddPolicy("p", "p", []string{"alice", "data1", ""}); !errors.Is(err, ErrTrailingEmptyField) {
+		t.Errorf("AddPolicy trailing empty: expected ErrTrailingEmptyField, got %v", err)
+	}
+	if err = a.AddPolicies("p", "p", [][]string{{"a", "b", "c"}, {"d", ""}}); !errors.Is(err, ErrTrailingEmptyField) {
+		t.Errorf("AddPolicies trailing empty: expected ErrTrailingEmptyField, got %v", err)
+	}
+	if err = a.UpdatePolicy("p", "p", []string{"a", "b", "c"}, []string{"x", ""}); !errors.Is(err, ErrTrailingEmptyField) {
+		t.Errorf("UpdatePolicy trailing empty new rule: expected ErrTrailingEmptyField, got %v", err)
+	}
+	if err = a.RemovePolicy("p", "p", []string{"a", ""}); !errors.Is(err, ErrTrailingEmptyField) {
+		t.Errorf("RemovePolicy trailing empty: expected ErrTrailingEmptyField, got %v", err)
+	}
+}
+
+// TestLoadFilteredPolicyNilFilter 验证 nil 与 *Filter 类型的空指针
+// 过滤器返回 ErrInvalidFilter 而非 panic
+func TestLoadFilteredPolicyNilFilter(t *testing.T) {
+	db := newFakeDB(t)
+	a, err := NewAdapterByDB(db)
+	if err != nil {
+		t.Fatalf("failed to create adapter: %v", err)
+	}
+	m, err := model.NewModelFromString(rbacModelText)
+	if err != nil {
+		t.Fatalf("failed to create model: %v", err)
+	}
+	ctx := context.Background()
+	if err = a.LoadFilteredPolicyCtx(ctx, m, nil); !errors.Is(err, ErrInvalidFilter) {
+		t.Errorf("nil filter: expected ErrInvalidFilter, got %v", err)
+	}
+	var f *Filter // typed-nil：类型断言成功但值为 nil，必须显式判空
+	if err = a.LoadFilteredPolicyCtx(ctx, m, f); !errors.Is(err, ErrInvalidFilter) {
+		t.Errorf("typed-nil filter: expected ErrInvalidFilter, got %v", err)
 	}
 }
 
@@ -363,7 +447,8 @@ func TestRecordToRule(t *testing.T) {
 	}
 }
 
-// TestModelToData 验证模型导出：p 与 g 分区全部策略
+// TestModelToData 验证模型导出：p 与 g 分区全部策略；
+// 长度与模型定义不符的规则被拒绝（保证保存成功的模型一定能加载回来）
 func TestModelToData(t *testing.T) {
 	m, err := model.NewModelFromString(rbacModelText)
 	if err != nil {
@@ -388,6 +473,30 @@ func TestModelToData(t *testing.T) {
 	}
 	if !reflect.DeepEqual(list, want) {
 		t.Errorf("modelToData = %v, want %v", list, want)
+	}
+
+	// p 分区规则长度与 token 数（3）不符：拒绝导出
+	m2, err := model.NewModelFromString(rbacModelText)
+	if err != nil {
+		t.Fatalf("failed to create model: %v", err)
+	}
+	if err = m2.AddPolicy(sectionPolicy, "p", []string{"alice", "data1"}); err != nil {
+		t.Fatalf("failed to add short p policy to model: %v", err)
+	}
+	if _, err = modelToData(names, m2); !errors.Is(err, ErrPolicySizeMismatch) {
+		t.Errorf("short p rule: expected ErrPolicySizeMismatch, got %v", err)
+	}
+
+	// g 分区规则长度小于 token 数（2）：拒绝导出
+	m3, err := model.NewModelFromString(rbacModelText)
+	if err != nil {
+		t.Fatalf("failed to create model: %v", err)
+	}
+	if err = m3.AddPolicy(sectionGroup, "g", []string{"alice"}); err != nil {
+		t.Fatalf("failed to add short g policy to model: %v", err)
+	}
+	if _, err = modelToData(names, m3); !errors.Is(err, ErrPolicySizeMismatch) {
+		t.Errorf("short g rule: expected ErrPolicySizeMismatch, got %v", err)
 	}
 }
 
@@ -956,12 +1065,13 @@ func TestFilteredAdapterNoAutoLoad(t *testing.T) {
 }
 
 // TestAddPoliciesMixedLength 验证字段长度不一的批量插入：
-// GoFrame 会拆分为多条 INSERT，事务保证整体原子性
+// GoFrame 会按字段集合将批量数据拆分为多条 INSERT，事务保证整体原子性。
+// 注意：2 字段的 p 规则仅用于触发拆分，其长度与 3 token 模型不符，
+// 无法通过 enforcer 加载（casbin 加载端校验规则长度），随后被清理
 func TestAddPoliciesMixedLength(t *testing.T) {
 	a := newTestAdapter(t)
 	initPolicy(t, a)
 
-	// p 规则 3 字段与 2 字段混批，触发 GoFrame 按字段分组拆分插入
 	rules := [][]string{
 		{"tom", "data3", "read"},
 		{"jerry"},
@@ -970,7 +1080,83 @@ func TestAddPoliciesMixedLength(t *testing.T) {
 		t.Fatalf("failed to add mixed policies: %v", err)
 	}
 
+	// 清理与模型不符的短规则行，恢复可加载状态
+	if err := a.RemovePolicies("p", "p", [][]string{{"jerry"}}); err != nil {
+		t.Fatalf("failed to remove short rule: %v", err)
+	}
+
 	e := newTestEnforcer(t, a)
-	expected := append(copyPolicies(testPolicies), rules...)
+	expected := append(copyPolicies(testPolicies), []string{"tom", "data3", "read"})
+	testGetPolicy(t, e, expected)
+}
+
+// TestRemovePoliciesLargeBatch 验证大批量删除按 batchSize 分块执行：
+// SQL Server 单语句参数上限 2100，每条规则元组 7 参数，300 条以上即越界。
+// 本测试使用 300+ 条规则，覆盖多分块路径（同时在 SQL Server 上
+// 回归分块修复）
+func TestRemovePoliciesLargeBatch(t *testing.T) {
+	a := newTestAdapter(t)
+
+	var rules [][]string
+	for i := 0; i < batchSize*3+7; i++ {
+		rules = append(rules, []string{"user" + strconv.Itoa(i), "data", "read"})
+	}
+	if err := a.AddPolicies("p", "p", rules); err != nil {
+		t.Fatalf("failed to add %d policies: %v", len(rules), err)
+	}
+	if err := a.RemovePolicies("p", "p", rules); err != nil {
+		t.Fatalf("failed to remove large batch: %v", err)
+	}
+	e := newTestEnforcer(t, a)
+	testGetPolicy(t, e, nil)
+}
+
+// TestUpdatePolicyNotFound 验证更新缺失旧规则的行为：
+// 旧规则不在库中返回 ErrPolicyNotFound（内存与数据库失联的显式信号）；
+// 新旧规则相同时即使驱动报告 0 行受影响也不报错
+func TestUpdatePolicyNotFound(t *testing.T) {
+	a := newTestAdapter(t)
+	initPolicy(t, a)
+
+	err := a.UpdatePolicy("p", "p", []string{"ghost", "x", "y"}, []string{"a", "b", "c"})
+	if !errors.Is(err, ErrPolicyNotFound) {
+		t.Errorf("missing old rule: expected ErrPolicyNotFound, got %v", err)
+	}
+
+	// 新旧相同：MySQL 等驱动对无变化 UPDATE 报 0 行受影响，属正常
+	if err = a.UpdatePolicy("p", "p", []string{"alice", "data1", "read"}, []string{"alice", "data1", "read"}); err != nil {
+		t.Errorf("same-value update should succeed, got %v", err)
+	}
+}
+
+// TestTransactionHelper 验证 Transaction 便捷方法：
+// fn 返回 nil 自动提交，返回错误自动回滚
+func TestTransactionHelper(t *testing.T) {
+	a := newTestAdapter(t)
+	initPolicy(t, a)
+	ctx := context.Background()
+
+	// 提交路径
+	err := a.Transaction(ctx, func(tx persist.Adapter) error {
+		return tx.AddPolicy("p", "p", []string{"alice", "data1", "write"})
+	})
+	if err != nil {
+		t.Fatalf("Transaction commit path failed: %v", err)
+	}
+	e := newTestEnforcer(t, a)
+	expected := append(copyPolicies(testPolicies), []string{"alice", "data1", "write"})
+	testGetPolicy(t, e, expected)
+
+	// 回滚路径：fn 返回错误自动回滚
+	sentinel := errors.New("business error")
+	if err = a.Transaction(ctx, func(tx persist.Adapter) error {
+		if err := tx.RemovePolicy("p", "p", []string{"alice", "data1", "write"}); err != nil {
+			return err
+		}
+		return sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Fatalf("rollback path: expected sentinel error, got %v", err)
+	}
+	e = newTestEnforcer(t, a)
 	testGetPolicy(t, e, expected)
 }
