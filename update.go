@@ -30,9 +30,11 @@ func updatePolicy(link dbLink, ctx context.Context, sec, ptype string, oldRule, 
 	}
 	// 新旧规则存在差异时，命中行必然发生变化，0 行受影响说明旧规则
 	// 不在库中；新旧完全相同时，部分驱动（如 MySQL 默认配置）对
-	// 无变化 UPDATE 报告 0 行受影响，属正常，不视为缺失
+	// 无变化 UPDATE 报告 0 行受影响，属正常，不视为缺失。
+	// RowsAffected 自身出错时（驱动不支持等罕见场景）跳过缺失检查，
+	// 避免 0 值被误判为规则不存在
 	if !samePaddedRule(oldRule, newRule) {
-		if affected, _ := res.RowsAffected(); affected == 0 {
+		if affected, rerr := res.RowsAffected(); rerr == nil && affected == 0 {
 			return fmt.Errorf("%w: %v", ErrPolicyNotFound, oldRule)
 		}
 	}

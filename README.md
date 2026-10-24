@@ -189,7 +189,7 @@ e.LoadFilteredPolicy(&gadapter.Filter{
 ## 事务
 
 方式一：`Transaction` 便捷方法，`fn` 返回 `nil` 自动提交、返回错误自动回滚，
-无需手动处理 Commit / Rollback：
+`fn` panic 时同样自动回滚（panic 原样向上传播），无需手动处理 Commit / Rollback：
 
 ```go
 import "github.com/casbin/casbin/v3/persist"

@@ -1160,3 +1160,32 @@ func TestTransactionHelper(t *testing.T) {
 	e = newTestEnforcer(t, a)
 	testGetPolicy(t, e, expected)
 }
+
+// TestTransactionHelperPanic 验证 fn panic 时事务自动回滚、
+// panic 原样向上传播、连接不悬挂（事务后仍可正常读写）
+func TestTransactionHelperPanic(t *testing.T) {
+	a := newTestAdapter(t)
+	initPolicy(t, a)
+
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		_ = a.Transaction(context.Background(), func(tx persist.Adapter) error {
+			if err := tx.AddPolicy("p", "p", []string{"alice", "data1", "write"}); err != nil {
+				return err
+			}
+			panic("boom")
+		})
+	}()
+	if !panicked {
+		t.Fatal("panic should propagate out of Transaction")
+	}
+
+	// panic 路径兜底回滚生效：数据不变，且连接可继续正常使用
+	e := newTestEnforcer(t, a)
+	testGetPolicy(t, e, testPolicies)
+}

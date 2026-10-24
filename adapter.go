@@ -142,6 +142,9 @@ func (a *Adapter) transaction(ctx context.Context, fn func(ctx context.Context, 
 
 // Transaction 在事务中执行 fn 并自动决定提交或回滚：fn 返回 nil 提交，
 // 返回错误回滚并原样返回该错误（回滚失败时附带说明）。
+// fn panic 时事务同样回滚，panic 原样向上传播（不吞不改，栈信息不丢）；
+// 一切未成功提交的出口——fn panic、Commit 失败、下方显式回滚自身失败——
+// 均由 defer 兜底回滚，避免活动事务悬挂占用连接。
 // fn 收到的适配器与 BeginTransaction 返回的 TransactionContext.GetAdapter()
 // 等价，实现全部 casbin 持久化扩展接口，事务内操作均在该事务中执行：
 //
@@ -158,13 +161,25 @@ func (a *Adapter) Transaction(ctx context.Context, fn func(persist.Adapter) erro
 	if err != nil {
 		return err
 	}
+	committed := false
+	// 兜底回滚：defer 在正常返回与 panic 展开时均执行（runtime.Goexit
+	// 亦然，且无需 recover），committed 仅在 Commit 成功后置位
+	defer func() {
+		if !committed {
+			_ = tc.Rollback()
+		}
+	}()
 	if err = fn(tc.GetAdapter()); err != nil {
 		if rerr := tc.Rollback(); rerr != nil && !errors.Is(rerr, ErrTransactionFinished) {
 			return fmt.Errorf("%w; rollback failed: %v", err, rerr)
 		}
 		return err
 	}
-	return tc.Commit()
+	if err = tc.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // checkActive 实现 dbLink：普通链路不存在生命周期问题，恒可用
